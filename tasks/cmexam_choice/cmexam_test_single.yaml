@@ -1,0 +1,13 @@
+task: cmexam_test_single
+dataset_path: json
+dataset_kwargs:
+  data_files: /root/autodl-tmp/MedicalGPT/data/eval/lm_eval/cmexam_test_single.jsonl
+test_split: train
+output_type: multiple_choice
+doc_to_text: "{{prompt}}"
+doc_to_choice: ["A", "B", "C", "D", "E"]
+doc_to_target: answer_idx
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true
