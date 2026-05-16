@@ -499,7 +499,7 @@ Top 排名前列样本特征：
 脚本能力：
 1. 读取第一阶段输出的 `cmb_cot_candidates_scored.jsonl`
 2. 默认只筛规则前 `top 3000` 候选题
-3. 调用 DeepSeek 返回结构化字段：
+3. 调用 DeepSeek 返回 CoT-worthiness 评估字段：
    - `decision`
    - `cot_worthiness_score`
    - `reasoning_need_score`
@@ -580,15 +580,12 @@ Pilot 观察：
 - 难度分层采样（`--stratified --target-size`）
 - 统计信息（`--stats`）
 
-#### `scripts/build_internal_holdout.py`
-Holdout 数据集构建脚本（**本地已完成，服务器上未执行**）
-
-#### `scripts/eval_medreason.py`
-评测脚本，支持：
-- 7 个评测指标：JSON 合规率、鉴别诊断覆盖、风险提示召回、过度自信率、主诊断准确率、字段完整率、响应长度
-- 按科室/难度分组统计
-- 基座模型 vs SFT 对比
-- **注意**：当前评测脚本针对结构化 JSON 输出场景，GRPO 刷分任务需要新的评测脚本
+#### `scripts/analyze_cot_mixed_diagnostics.py`
+CoT/Mixed 诊断脚本，支持：
+- 读取 Direct 与 CoT/Mixed 的 lm-eval sample-level 输出
+- 对 single-choice loglikelihood 样本恢复选项预测
+- 对 multi-choice 生成样本统计答案抽取、非法答案、输出长度、漏选率和多选率
+- 输出 `data/analysis/*.json` 和 `docs/cot_mixed_diagnostics*.md`
 
 ### 3.3 项目路径结构
 ```
@@ -610,8 +607,9 @@ MedicalGPT/
 │       └── CMB-test/CMB-test-choice-question-merge.json
 ├── scripts/
 │   ├── prepare_cmb_sft.py         # 本地完成
-│   ├── build_internal_holdout.py   # 本地完成
-│   └── eval_medreason.py           # 本地完成
+│   ├── build_cot_candidates.py     # 本地完成
+│   ├── build_cot_mixed_sft.py      # 本地完成
+│   └── analyze_cot_mixed_diagnostics.py
 └── training/
     └── supervised_finetuning.py   # 已在服务器（做过两处小修改）
 ```
@@ -910,7 +908,7 @@ total_reward =
 
 ### 6.2 推荐面试叙事
 
-> "我选择中文医学考试作为可控实验场景，因为它有明确答案，适合量化评测。项目先用 CMB 做 SFT，比较不同数据构造策略；然后引入 CoT 格式，让模型输出分析过程和答案；最后用 GRPO 做多维 reward shaping，不只优化答案正确率，也约束输出格式、推理结构和医疗安全表达。评测上，我不用单一 CMB-val，而是扩展到 CMExam-test 和 C-Eval 医学子集，验证跨 benchmark 泛化。"
+> "我选择中文医学考试作为可控实验场景，因为它有明确答案，适合量化评测。项目先用 CMB 做 SFT，比较不同数据构造策略；然后引入 CoT 格式，让模型输出分析过程和答案；最后用 GRPO 做多维 reward shaping，不只优化答案正确率，也约束答案格式和医疗安全表达。评测上，我不用单一 CMB-val，而是扩展到 CMExam-test 和 C-Eval 医学子集，验证跨 benchmark 泛化。"
 
 ### 6.3 最容易被问的问题及答案
 
