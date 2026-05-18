@@ -24,6 +24,9 @@ DEFAULT_OUTPUT = "data/processed/cmb_clean/cmb_train_clean.jsonl"
 DEFAULT_REJECTED = "data/processed/cmb_clean/cmb_train_rejected.jsonl"
 DEFAULT_SUMMARY = "data/processed/cmb_clean/cmb_clean_summary.md"
 
+NON_MEDICAL_EXAM_CLASSES = {"考研政治"}
+NON_MEDICAL_EXAM_SUBJECTS = {"考研政治"}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Clean CMB-Exam train candidates.")
@@ -124,12 +127,27 @@ def reject(row: dict[str, Any], reason: str, detail: str = "") -> dict[str, Any]
     return out
 
 
+def is_non_medical_domain(row: dict[str, Any]) -> tuple[bool, str]:
+    exam_class = clean_text(row.get("exam_class"))
+    exam_subject = clean_text(row.get("exam_subject"))
+
+    if exam_class in NON_MEDICAL_EXAM_CLASSES:
+        return True, f"exam_class={exam_class}"
+    if exam_subject in NON_MEDICAL_EXAM_SUBJECTS:
+        return True, f"exam_subject={exam_subject}"
+    return False, ""
+
+
 def validate_and_clean(row: dict[str, Any], args: argparse.Namespace, seen_signatures: set[str]) -> tuple[dict[str, Any] | None, dict[str, Any] | None, list[str]]:
     flags: list[str] = []
 
     question = clean_text(row.get("question"))
     if not question:
         return None, reject(row, "missing_question"), flags
+
+    non_medical, non_medical_detail = is_non_medical_domain(row)
+    if non_medical:
+        return None, reject(row, "non_medical_domain", non_medical_detail), flags
 
     options_raw = row.get("option")
     if not isinstance(options_raw, dict):
