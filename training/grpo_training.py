@@ -4,10 +4,13 @@
 @description: Train R1 model with GRPO rl algo.
 """
 import os
+import sys
+from glob import glob
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, Optional
 import re
+import inspect
 from datasets import load_dataset
 import torch
 from loguru import logger
@@ -15,9 +18,23 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.integrations import is_deepspeed_zero3_enabled
 from trl import GRPOConfig, GRPOTrainer, ModelConfig, TrlParser
-from peft import LoraConfig, TaskType, get_peft_model
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
+
+try:
+    from scripts.grpo_med_choice_rewards import med_choice_reward
+except ImportError:
+    med_choice_reward = None
+
+try:
+    from scripts.grpo_med_choice_rewards_v2 import med_choice_reward_v2
+except ImportError:
+    med_choice_reward_v2 = None
 
 os.environ["TOKENIZERS_PARALLELISM"] = "FALSE"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -47,6 +64,12 @@ class ScriptArguments:
                                                      metadata={"help": "Number of workers for preprocessing"})
     # QLoRA arguments
     qlora: bool = field(default=False, metadata={"help": "Whether to use qlora"})
+    reward_type: Optional[str] = field(
+        default="math",
+        metadata={"help": "Reward type: math or med_choice."},
+    )
+    peft_path: Optional[str] = field(default=None, metadata={"help": "Optional PEFT adapter path for policy init."})
+    ref_peft_path: Optional[str] = field(default=None, metadata={"help": "Optional frozen PEFT adapter path for reference model."})
 
 
 def normalize_text(text):
@@ -195,8 +218,16 @@ def grpo_train(
 
     # Load datasets
     if script_args.train_file_dir and os.path.exists(script_args.train_file_dir):
-        # Load from local directory
-        dataset = load_dataset("json", data_dir=script_args.train_file_dir, split="train")
+        # Load from a local JSON/JSONL file or a directory.
+        if os.path.isfile(script_args.train_file_dir):
+            data_files = [script_args.train_file_dir]
+        else:
+            data_files = sorted(glob(os.path.join(script_args.train_file_dir, "*.jsonl")))
+            if not data_files:
+                data_files = sorted(glob(os.path.join(script_args.train_file_dir, "*.json")))
+            if not data_files:
+                raise FileNotFoundError(f"No JSON/JSONL training files found in {script_args.train_file_dir}")
+        dataset = load_dataset("json", data_files=data_files, split="train")
     else:
         # Load from HuggingFace hub
         dataset = load_dataset(script_args.dataset_name, script_args.subset_name, split=script_args.dataset_splits)
@@ -206,17 +237,29 @@ def grpo_train(
 
     # Prepare dataset
     with training_args.main_process_first(desc="Dataset preparation"):
-        dataset = dataset.map(
-            lambda x: {
-                'prompt': [
-                    {'role': 'system', 'content': SYSTEM_PROMPT},
-                    {'role': 'user', 'content': x['question']}
-                ],
-                'answer': x['answer']
-            },
-            num_proc=script_args.preprocessing_num_workers,
-            desc="Processing dataset" if is_main_process else None,
-        )
+        if script_args.reward_type in {"med_choice", "med_choice_v2"}:
+            dataset = dataset.map(
+                lambda x: {
+                    'prompt': x['prompt'],
+                    'answer': x['answer'],
+                    'valid_options': x.get('valid_options', list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")),
+                    'sample_id': x.get('sample_id', ''),
+                },
+                num_proc=script_args.preprocessing_num_workers,
+                desc=f"Processing {script_args.reward_type} dataset" if is_main_process else None,
+            )
+        else:
+            dataset = dataset.map(
+                lambda x: {
+                    'prompt': [
+                        {'role': 'system', 'content': SYSTEM_PROMPT},
+                        {'role': 'user', 'content': x['question']}
+                    ],
+                    'answer': x['answer']
+                },
+                num_proc=script_args.preprocessing_num_workers,
+                desc="Processing dataset" if is_main_process else None,
+            )
 
     # Split dataset
     train_test_split = dataset.train_test_split(test_size=0.1)
@@ -320,6 +363,20 @@ def grpo_train(
         **model_kwargs,
     )
 
+    trainer_accepts_ref_model = "ref_model" in inspect.signature(GRPOTrainer.__init__).parameters
+    ref_model = None
+    if script_args.ref_peft_path and trainer_accepts_ref_model:
+        if is_main_process:
+            logger.info(f"Loading frozen reference adapter from: {script_args.ref_peft_path}")
+        ref_model = AutoModelForCausalLM.from_pretrained(
+            model_args.model_name_or_path,
+            **model_kwargs,
+        )
+        ref_model = PeftModel.from_pretrained(ref_model, script_args.ref_peft_path, is_trainable=False)
+        ref_model.eval()
+    elif script_args.ref_peft_path and is_main_process:
+        logger.warning("This TRL GRPOTrainer does not expose ref_model; skipping explicit reference model load.")
+
     # Patch MoE modules for DeepSpeed ZeRO-3
     model_type = getattr(config, "model_type", None) if config else getattr(model.config, "model_type", None)
     if model_type == "mixtral" and is_deepspeed_zero3_enabled():
@@ -358,20 +415,25 @@ def grpo_train(
         if training_args.gradient_checkpointing:
             logger.warning("Gradient checkpointing is enabled. It may cause issues with LoRA, setting it to False.")
             training_args.gradient_checkpointing = False
-        target_modules = model_args.lora_target_modules if model_args.lora_target_modules else None
-        if target_modules == 'all' or (target_modules and 'all' in target_modules):
-            target_modules = find_all_linear_names(model, int4=model_args.load_in_4bit, int8=model_args.load_in_8bit)
-        if is_main_process:
-            logger.info(f"Peft target_modules: {target_modules}, lora rank: {model_args.lora_r}, ")
-        peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            target_modules=target_modules,
-            inference_mode=False,
-            r=model_args.lora_r,
-            lora_alpha=model_args.lora_alpha,
-            lora_dropout=model_args.lora_dropout,
-        )
-        model = get_peft_model(model, peft_config)
+        if script_args.peft_path:
+            if is_main_process:
+                logger.info(f"Loading trainable policy adapter from: {script_args.peft_path}")
+            model = PeftModel.from_pretrained(model, script_args.peft_path, is_trainable=True)
+        else:
+            target_modules = model_args.lora_target_modules if model_args.lora_target_modules else None
+            if target_modules == 'all' or (target_modules and 'all' in target_modules):
+                target_modules = find_all_linear_names(model, int4=model_args.load_in_4bit, int8=model_args.load_in_8bit)
+            if is_main_process:
+                logger.info(f"Peft target_modules: {target_modules}, lora rank: {model_args.lora_r}, ")
+            peft_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                target_modules=target_modules,
+                inference_mode=False,
+                r=model_args.lora_r,
+                lora_alpha=model_args.lora_alpha,
+                lora_dropout=model_args.lora_dropout,
+            )
+            model = get_peft_model(model, peft_config)
         # Fixed FP16 ValueError for quantized models
         for param in filter(lambda p: p.requires_grad, model.parameters()):
             param.data = param.data.to(torch.float32)
@@ -388,18 +450,36 @@ def grpo_train(
         model.config.use_cache = True
         logger.info("Gradient checkpointing disabled.")
 
-    # Initialize GRPO trainer with distributed training support
-    trainer = GRPOTrainer(
-        model=model,
-        processing_class=tokenizer,
-        reward_funcs=[
+    if script_args.reward_type in {"med_choice", "med_choice_v2"}:
+        if med_choice_reward is None:
+            raise ImportError("scripts.grpo_med_choice_rewards.med_choice_reward is not importable.")
+        if script_args.reward_type == "med_choice_v2":
+            if med_choice_reward_v2 is None:
+                raise ImportError("scripts.grpo_med_choice_rewards_v2.med_choice_reward_v2 is not importable.")
+            reward_funcs = [med_choice_reward_v2]
+        else:
+            reward_funcs = [med_choice_reward]
+    else:
+        reward_funcs = [
             accuracy_reward,
             format_reward
-        ],
+        ]
+
+    # Initialize GRPO trainer with distributed training support
+    trainer_kwargs = dict(
+        model=model,
+        processing_class=tokenizer,
+        reward_funcs=reward_funcs,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=test_dataset if training_args.eval_strategy != "no" else None,
     )
+    if ref_model is not None and trainer_accepts_ref_model:
+        trainer_kwargs["ref_model"] = ref_model
+    elif ref_model is not None and is_main_process:
+        logger.warning("This TRL GRPOTrainer does not expose ref_model; using its internal reference handling.")
+
+    trainer = GRPOTrainer(**trainer_kwargs)
     logger.info("*** GRPO Trainer initialized ***")
     logger.debug(f"Trainer: {trainer}")
 

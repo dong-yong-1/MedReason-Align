@@ -1008,3 +1008,79 @@ A：刷题只看 accuracy；这个项目还比较数据策略、CoT 输出结构
 面试表述：
 
 > "我没有把所有样本都强行改成 CoT，而是先用规则和 DeepSeek 筛出最适合显式推理的题，再让 teacher 生成解析。最终训练集保持 5000 条总量不变，其中约 20% 是 CoT 样本，其余仍是 Direct-answer 样本。这样可以验证 CoT 监督本身是否带来收益，而不是因为训练样本总量变多导致结果变化。"
+
+---
+
+## 十、最新进展：GRPO 多选边界 pilot（2026-05-17 至 2026-05-18）
+
+### 10.1 研究问题
+
+paired control 与 sample-level 诊断显示，CoT/Mixed SFT 在 CMExam-test-multi 上的主要问题不是答案抽取失败或截断，而是更容易多选额外选项。GRPO pilot 的目标因此收窄为：
+
+```text
+减少多选题 extra option，提高 precision，同时不要严重牺牲 recall。
+```
+
+### 10.2 GRPO v1
+
+v1 使用医学选择题 reward：
+
+```text
+reward = format_reward
+       + exact_match_reward
+       + 0.5 * option_f1
+       - 0.3 * extra_count
+       - 0.2 * missing_count
+       + invalid_penalty
+       + too_long_penalty
+```
+
+CoT/Mixed SFT 与 CoT/Mixed + GRPO v1 在 CMExam-test-multi 上的对比：
+
+| 模型 | EM | extra_option_rate | missed_gold_rate | precision | recall | F1 |
+|---|---:|---:|---:|---:|---:|---:|
+| CoT/Mixed SFT | 0.6078 | 0.2549 | 0.2059 | 0.9043 | 0.9187 | 0.9114 |
+| CoT/Mixed + GRPO v1 | 0.6127 | 0.2549 | 0.1961 | 0.9007 | 0.9216 | 0.9110 |
+
+结论：v1 pipeline 跑通，EM 小幅上升，但 extra_option_rate 没有下降；precision 略降、recall 略升，说明 reward/prompt 仍偏 recall-oriented。训练中 `completions/mean_length` 经常等于 256，`clipped_ratio` 接近 1.0，reward 信号可能受到长输出和截断污染。
+
+### 10.3 Answer-boundary GRPO v2
+
+v2 不继续训练长 CoT，先做 answer-only 的答案边界对齐：
+
+- prompt 明确要求只输出一行 `答案：X`
+- `max_completion_length` 从 256 降到 64
+- reward 更偏 precision：`+0.8 * precision`、`+0.2 * recall`
+- extra penalty 加重到 `-0.7 * extra_count`
+- missing penalty 保持 `-0.2 * missing_count`
+- 多个 `答案：`、答案后解释、过长 completion 都扣分
+
+服务器上 v2 prompt pool：
+
+| 项目 | 数值 |
+|---|---:|
+| total | 1899 |
+| single | 1000 |
+| multi | 899 |
+| source | `data/sft/cmb_cot_mixed/cmb_sft_cot_mixed.jsonl` |
+
+说明：服务器上 `data/processed/cmb_clean/cmb_train_vector_dedup_bucket.jsonl` 不存在，因此脚本按优先级 fallback 到 CoT/Mixed SFT 数据，多选桶未能取满目标计划。
+
+v2 训练过程：
+
+- 120 steps 完成
+- train_runtime：0:06:58
+- KL 约 0.0018-0.0024
+- reward mean 后段约 0.68-1.27
+- `completions/mean_length` 仍接近 64
+- `clipped_ratio` 仍为 0.975-1.0
+
+v2 CMExam-test-multi 结果：
+
+| 模型 | exact_match |
+|---|---:|
+| CoT/Mixed SFT | 0.6078 |
+| CoT/Mixed + GRPO v1 | 0.6127 |
+| CoT/Mixed + GRPO v2 | 0.6078 |
+
+结论：v2 reward sanity check 通过，但训练过程仍有明显截断红旗，最终 EM 回到 SFT 基线，没有超过 v1。当前不能认为 GRPO v2 已经修复 CoT/Mixed 的多选边界问题。下一步应优先做 v2 sample-level diagnostics，确认 extra_option_rate 是否下降；若 extra 未降，应先修 stop/EOS、严格 answer-only 格式和 generation 终止，再考虑继续训练或跑 48-token 备用配置。
