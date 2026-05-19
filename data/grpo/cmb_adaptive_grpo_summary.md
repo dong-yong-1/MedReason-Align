@@ -1,84 +1,96 @@
-# Adaptive GRPO 数据构造报告
+# Adaptive GRPO Data Summary
 
-## 输入与输出
+## Inputs And Outputs
 
-- input_path: `data/processed/cmb_clean/cmb_cot_candidates_scored.jsonl`
-- output_jsonl: `data/grpo/cmb_adaptive_grpo_train.jsonl`
+- input: `data/processed/cmb_clean/cmb_cot_candidates_scored.jsonl`
+- train_output: `data/grpo/cmb_adaptive_grpo_train.jsonl`
 - full_distribution_json: `data/grpo/cmb_adaptive_grpo_full_distribution.json`
 - direct_review_jsonl: `data/grpo/cmb_adaptive_grpo_direct_review_50.jsonl`
+- brief_review_jsonl: `data/grpo/cmb_adaptive_grpo_brief_review_50.jsonl`
 - cot_review_jsonl: `data/grpo/cmb_adaptive_grpo_cot_review_50.jsonl`
-- 注意：输入来自 clean pool 的全量 `cot_candidate_score` 打分文件，不使用 `cmb_cot_mixed`，输出不包含 teacher CoT 文本。
 
-## Difficulty 规则
+## Classification Rules
 
-- easy: `cot_candidate_score <= -0.1`
-- medium: `-0.1 < cot_candidate_score <= 0.9`
-- hard: `cot_candidate_score > 0.9`
+- `reasoning_score = case_info_score + option_confusion_score - definition_penalty - low_reasoning_penalty`
+- `definition_level == strong` -> direct
+- `reasoning_score <= -0.3` -> direct
+- `reasoning_score > 0.5` -> cot, except multi-choice concept/recall rows without real case context are brief
+- remaining rows -> brief
 
-## 全量 Clean Pool 分布
+## Full Distribution
 
-- total: 233188
+- total: 232106
 
-| difficulty | count |
+### By Difficulty
+
+| key | count |
 |---|---:|
-| easy | 77978 |
-| medium | 84361 |
-| hard | 70849 |
+| direct | 45927 |
+| brief | 111764 |
+| cot | 74415 |
 
-### 全量分数统计
+### By Question Type
+
+| key | count |
+|---|---:|
+| multi | 23504 |
+| single | 208602 |
+
+### Full Reasoning Score Quantiles
 
 ```json
 {
   "min": -1.6,
   "p25": -0.1,
   "p50": 0.3,
-  "p75": 1.2,
-  "p90": 1.9,
-  "max": 5.1
+  "p75": 0.9,
+  "p90": 1.4,
+  "max": 3.1
 }
 ```
 
-## 训练集 1:1:1 分层采样
+## Train Sampling
 
+- target_per_difficulty: 1500
 - total: 4500
 
-| difficulty | selected |
+### Train By Difficulty
+
+| key | count |
 |---|---:|
-| easy | 1500 |
-| medium | 1500 |
-| hard | 1500 |
+| direct | 1500 |
+| brief | 1500 |
+| cot | 1500 |
 
-### 训练集题型分布
+### Train By Question Type
 
-```json
-{
-  "multi": 509,
-  "single": 3991
-}
-```
+| key | count |
+|---|---:|
+| multi | 453 |
+| single | 4047 |
 
-### 训练集答案长度分布
+### Train Reasoning Score Quantiles
 
 ```json
 {
-  "3": 163,
-  "1": 3991,
-  "5": 75,
-  "4": 168,
-  "2": 102,
-  "6": 1
+  "min": -1.5,
+  "p25": -0.5,
+  "p50": 0.3,
+  "p75": 0.9,
+  "p90": 1.4,
+  "max": 3.1
 }
 ```
 
-### 跳过样本
+## Review Sampling
+
+- review_count_per_difficulty: 50
+- direct review: random single-choice rows from direct; falls back to all direct rows if needed.
+- brief review: random rows from brief.
+- cot review: random multi-choice rows from cot; falls back to all cot rows if needed.
+
+## Skip Counts
 
 ```json
 {}
 ```
-
-## 人工检查抽样
-
-- direct/easy review: `data/grpo/cmb_adaptive_grpo_direct_review_50.jsonl`
-- cot/hard review: `data/grpo/cmb_adaptive_grpo_cot_review_50.jsonl`
-- direct review 从 easy 中优先抽单选题，用于检查低 CoT 价值样本是否确实更适合直接答题。
-- cot review 从 hard 中优先抽多选题，用于检查高 CoT 价值样本是否确实更需要推理/逐项分析。
